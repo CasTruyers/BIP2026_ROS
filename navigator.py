@@ -67,12 +67,16 @@ class GoToBeaconOdom(Node):
     def on_position(self, msg):
         self.robot_x = msg.pose.pose.position.x
         self.robot_y = msg.pose.pose.position.y
+
+        self.get_logger().info(f"Odom: x={self.robot_x:.2f}, y={self.robot_y:.2f}")
+
         q = msg.pose.pose.orientation
         self.robot_theta = yaw_from_quaternion(q.x, q.y, q.z, q.w)
         self.odom_received = True
 
     def on_distance(self, msg):
         self.current_distance = msg.data
+        self.get_logger().info(f"Distance: {self.current_distance:.1f}")
 
     def on_goal(self, msg):
         self.target_x = msg.x
@@ -111,13 +115,23 @@ class GoToBeaconOdom(Node):
         else:
             theta_T = math.atan2(ey, ex)
             e_theta = wrap_to_pi(theta_T - self.robot_theta)
+            e_theta_deg = math.degrees(e_theta)
             omega = clip(self.k_theta * e_theta, -self.omega_max, self.omega_max)
 
             if abs(e_theta) > self.theta_align:
                 v = 0.0
+                self.get_logger().info(
+                    f"ALIGNING: Error is {e_theta_deg:.1f}°. Spinning...", 
+                    throttle_duration_sec=0.5
+                )
             else:
                 # FIXED: changed 'd' to 'dist_to_goal'
                 v = clip(self.k_d * dist_to_goal, 0.0, self.v_max)
+                self.get_logger().info(
+                    f"ALIGNED: Error {e_theta_deg:.1f}°. Driving forward.", 
+                    throttle_duration_sec=1.0
+                )
+
 
             # Smooth slowing down
             slow_radius = 0.4
