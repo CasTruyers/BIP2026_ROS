@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import math
 import rclpy
+import time
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32
-from geometry_msgs.msg import Pose, Twist, Point # Added Point for manual goal input
+from geometry_msgs.msg import Pose, Twist, Point
 
 def yaw_from_quaternion(x, y, z, w):
     siny_cosp = 2.0 * (w * z + x * y)
@@ -23,8 +24,13 @@ class GoToBeaconOdom(Node):
 
         # -------- Navigation State --------
         self.current_distance = 100.0
-        self.distance_threshold = 50.0 # Caution: Ensure units match (cm vs m)
+        self.distance_threshold = 30.0
         self.state = "GO_TO_GOAL"
+        
+        # TO OPTIMIZE:
+        # self.clearance_start_time = 0.0
+        # self.clearance_duration = 1.5 # Seconds to drive forward after avoiding
+        # self.is_clearing = False
 
         # These will be updated by the /goal_point subscriber
         self.target_x = 0.0 
@@ -33,12 +39,12 @@ class GoToBeaconOdom(Node):
 
         # -------- Parameters --------
         self.declare_parameter("control_rate_hz", 10.0)
-        self.declare_parameter("k_theta", 1.8)
-        self.declare_parameter("k_d", 0.8)
+        self.declare_parameter("k_theta", 1.8) # Angular Gain, how aggresively we turn. Oscillations when too high.
+        self.declare_parameter("k_d", 0.8) # Linear Gain. Scales speed based on distance. How much it slows down as it approaches the goal. Too high can cause overshoot, too low can be too slow.
         self.declare_parameter("v_max", 0.6)
         self.declare_parameter("omega_max", 1.5)
         self.declare_parameter("goal_tolerance", 0.25)
-        self.declare_parameter("theta_align_deg", 20.0)
+        self.declare_parameter("theta_align_deg", 20.0) # if angle error larger then this, we just rotate in place.
 
         self.control_rate_hz = self.get_parameter("control_rate_hz").value
         self.k_theta = self.get_parameter("k_theta").value
@@ -46,7 +52,7 @@ class GoToBeaconOdom(Node):
         self.v_max = self.get_parameter("v_max").value
         self.omega_max = self.get_parameter("omega_max").value
         self.goal_tolerance = self.get_parameter("goal_tolerance").value
-        self.theta_align = math.radians(self.get_parameter("theta_align_deg").value)
+        self.theta_align = math.radians(self.get_parameter("theta_align_deg").value) # Convert to radians
 
         # -------- I/O --------
         self.cmd_pub = self.create_publisher(Twist, "/velocity_CRJG", 10)
@@ -89,54 +95,67 @@ class GoToBeaconOdom(Node):
         if not self.goal_received or not self.odom_received:
             return
 
-        ex = self.target_x - self.robot_x
-        ey = self.target_y - self.robot_y
-        dist_to_goal = math.sqrt(ex**2 + ey**2)
-
-        if dist_to_goal < self.goal_tolerance:
-            self.cmd_pub.publish(Twist()) # Corrected method name
-            self.get_logger().info("Goal Reached!")
-            self.goal_received = False # Reset until next goal
-            return
-
-        # State Logic
+        # 1. Check Ultrasound
         if self.current_distance < self.distance_threshold:
             self.state = "AVOID_OBSTACLE"
-        elif self.state == "AVOID_OBSTACLE" and self.current_distance > (self.distance_threshold + 10.0):
-            self.state = "GO_TO_GOAL"
+            self.is_clearing = False
 
-        v = 0.0
+        v = 0.0 # Velocity
         omega = 0.0
 
+        # 2. State Machine
         if self.state == "AVOID_OBSTACLE":
             v = 0.0 
             omega = 0.5 
-            self.get_logger().warn("Obstacle Detected! Turning...")
-        else:
-            theta_T = math.atan2(ey, ex)
+            self.get_logger().warn("Obstacle Detected! Turning...", throttle_duration_sec=1)
+            
+            # Transition if LineOfSight is clear
+            if self.current_distance > (self.distance_threshold + 20): 
+                self.state = "CLEARANCE_PHASE"
+                self.clearance_start_time = time.time()
+                self.is_clearing = True
+        
+        elif self.state == "CLEARANCE_PHASE":
+            # Drive Straight after avoid-turning
+            v = 0.3 # static speed
+            omega = 0.0
+            self.get_logger().info("Clearance: Driving Forward...", throttle_duration_sec=1)
+
+            # Transition: Check if time is up
+            if (time.time() - self.clearance_start_time) > self.clearance_duration:
+                self.state = "GO_TO_GOAL"
+                self.is_clearing = False
+            
+        elif self.state == "GO_TO_GOAL":
+            ex = self.target_x - self.robot_x
+            ey = self.target_y - self.robot_y
+            dist_to_goal = math.sqrt(ex**2 + ey**2)
+
+            if dist_to_goal < self.goal_tolerance: # Goal Reached
+                self.cmd_pub.publish(Twist()) # Stop the robot
+                self.get_logger().info("Goal Reached!")
+                self.goal_received = False # Reset until next goal
+                return
+            
+            theta_T = math.atan2(ey, ex) # The angle to the goal
             e_theta = wrap_to_pi(theta_T - self.robot_theta)
-            e_theta_deg = math.degrees(e_theta)
             omega = clip(self.k_theta * e_theta, -self.omega_max, self.omega_max)
+            
+            # Only used for logging/visualization
+            e_theta_deg = math.degrees(e_theta) 
 
-            if abs(e_theta) > self.theta_align:
+            if abs(e_theta) > self.theta_align: # If error too big, we set velocity to zero and just rotate in place
                 v = 0.0
-                self.get_logger().info(
-                    f"ALIGNING: Error is {e_theta_deg:.1f}°. Spinning...", 
-                    throttle_duration_sec=0.5
-                )
+                self.get_logger().info(f"ALIGNING: Error is {e_theta_deg:.1f}°. Spinning...", throttle_duration_sec=1.0)
             else:
-                # FIXED: changed 'd' to 'dist_to_goal'
                 v = clip(self.k_d * dist_to_goal, 0.0, self.v_max)
-                self.get_logger().info(
-                    f"ALIGNED: Error {e_theta_deg:.1f}°. Driving forward.", 
-                    throttle_duration_sec=1.0
-                )
+                self.get_logger().info(f"ALIGNED: Error {e_theta_deg:.1f}°. Driving forward.", throttle_duration_sec=1.0)
 
-
-            # Smooth slowing down
-            slow_radius = 0.4
-            if dist_to_goal < slow_radius:
-                v *= dist_to_goal / slow_radius
+            # FOR LATER OPTIMIZATION:
+            # # Smooth slowing down around the goal
+            # slow_radius = 0.4
+            # if dist_to_goal < slow_radius:
+            #     v *= dist_to_goal / slow_radius
 
         cmd = Twist()
         cmd.linear.x = float(v)
