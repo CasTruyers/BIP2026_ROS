@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+import math
+import rclpy
+import time
+from rclpy.node import Node
+from std_msgs.msg import Float64
+from geometry_msgs.msg import Twist, Point, Vector3
+
+def wrap_to_pi(angle):
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+def clip(value, lo, hi):
+    return max(lo, min(hi, value))
+
+class GoToBeaconOdom(Node):
+    def __init__(self):
+        super().__init__("go_to_beacon_odom")
+
+        # -------- Navigation State --------
+        self.current_distance = 100.0
+        self.distance_threshold = 30.0
+        self.state = "CALIBRATING_HEADING" # Robot starts blind, must calibrate first
+        
+        # -------- Heading Calculation Variables --------
+        self.prev_x = None
+        self.prev_y = None
+        self.has_heading = False
+        self.min_dist_for_heading = 0.20 # It must travel 20cm to get a clean angle calculation (adjust based on UWB noise)
+
+        # These will be updated by the /goal_point subscriber
+        self.target_x = 0.0 
+        self.target_y = 0.0
+        self.goal_received = False
+
+        # -------- Parameters --------
+        self.declare_parameter("control_rate_hz", 1.0)
+        self.declare_parameter("k_theta", 3.0) 
+        self.declare_parameter("k_d", 0.8) 
+        self.declare_parameter("v_max", 0.6)
+        self.declare_parameter("omega_max", 5.0)
+        self.declare_parameter("goal_tolerance", 0.25)
+        self.declare_parameter("theta_align_deg", 20.0) 
+
+        self.control_rate_hz = self.get_parameter("control_rate_hz").value
+        self.k_theta = self.get_parameter("k_theta").value
+        self.k_d = self.get_parameter("k_d").value
+        self.v_max = self.get_parameter("v_max").value
+        self.omega_max = self.get_parameter("omega_max").value
+        self.goal_tolerance = self.get_parameter("goal_tolerance").value
+        self.theta_align = math.radians(self.get_parameter("theta_align_deg").value) 
+
+        # -------- I/O --------
+        self.cmd_pub = self.create_publisher(Twist, "/cmdV_CRJG", 10)
+        
+        self.create_subscription(Vector3, "/location_CRJG", self.on_position, 10)
+        self.create_subscription(Float64, "/distance_CRJG", self.on_distance, 10)
+        self.create_subscription(Point, "/goal_point", self.on_goal, 10)
+
+        self.robot_x = 0.0
+        self.robot_y = 0.0
+        self.robot_theta = 0.0
+        self.odom_received = False
+
+        self.timer = self.create_timer(1.0 / self.control_rate_hz, self.control_step)
+        self.get_logger().info("Navigation Node Initialized. Waiting for Location Data...")
+
+    def on_position(self, msg):
+        self.robot_x = msg.x
+        self.robot_y = msg.y
+
+        # Initialize the reference point on the very first message
+        if self.prev_x is None or self.prev_y is None:
+            self.prev_x = self.robot_x
+            self.prev_y = self.robot_y
+            self.odom_received = True
+            return
+
+        # Calculate how far we have driven since the last heading update
+        dist_moved = math.hypot(self.robot_x - self.prev_x, self.robot_y - self.prev_y)
+
+        # Only update the heading if we have moved far enough to get a clean line
+        if dist_moved >= self.min_dist_for_heading:
+            # atan2(dy, dx) gives us our exact trajectory angle
+            self.robot_theta = math.atan2(self.robot_y - self.prev_y, self.robot_x - self.prev_x)
+            
+            # Reset the reference point to our current location
+            self.prev_x = self.robot_x
+            self.prev_y = self.robot_y
+            self.has_heading = True
+            
+            self.get_logger().info(f"Heading Updated: {math.degrees(self.robot_theta):.1f}°")
+
+    def on_distance(self, msg):
+        self.current_distance = msg.data
+
+    def on_goal(self, msg):
+        self.target_x = msg.x
+        self.target_y = msg.y
+        self.goal_received = True
+        self.get_logger().info(f"New Goal Received: x={msg.x}, y={msg.y}")
+
+    def control_step(self):
+        if not self.goal_received or not self.odom_received:
+             return
+
+        # 1. Check Ultrasound
+        if self.current_distance < self.distance_threshold and self.current_distance > 0:
+            self.state = "AVOID_OBSTACLE"
+
+        v = 0.0 
+        omega = 0.0
+
+        # 2. State Machine
+        if self.state == "AVOID_OBSTACLE":
+            v = 0.0 
+            omega = 1.0 # Spin to clear obstacle
+            self.get_logger().warn("Obstacle Detected! Turning...", throttle_duration_sec=1.0)
+            
+            # Transition if LineOfSight is clear
+            if self.current_distance > (self.distance_threshold + 20): 
+                # CRITICAL: We just spun in place, so our calculated heading is now completely wrong.
+                # We must wipe it and force the robot to recalibrate.
+                self.has_heading = False
+                self.prev_x = self.robot_x 
+                self.prev_y = self.robot_y
+                self.state = "CALIBRATING_HEADING" 
+                
+        elif self.state == "CALIBRATING_HEADING":
+            # Drive straight blindly until on_position() determines we've moved far enough
+            v = 0.25 
+            omega = 0.0
+            self.get_logger().info("Calibrating Heading (Driving Straight)...", throttle_duration_sec=1.0)
+            
+            # Once on_position triggers the flag, we can resume normal navigation
+            if self.has_heading:
+                self.state = "GO_TO_GOAL"
+            
+        elif self.state == "GO_TO_GOAL":
+            ex = self.target_x - self.robot_x
+            ey = self.target_y - self.robot_y
+            dist_to_goal = math.sqrt(ex**2 + ey**2)
+            self.get_logger().info(f"Distance to Goal: {dist_to_goal:.1f}m", throttle_duration_sec=1.0)
+
+            if abs(dist_to_goal) < self.goal_tolerance: 
+                self.cmd_pub.publish(Twist()) 
+                self.get_logger().info("Goal Reached!")
+                self.goal_received = False 
+                # We reached the goal, invalidate heading so next goal starts with calibration
+                self.has_heading = False 
+                return
+            
+            theta_T = math.atan2(ey, ex) 
+            e_theta = wrap_to_pi(theta_T - self.robot_theta)
+            omega = clip(self.k_theta * e_theta, -self.omega_max, self.omega_max)
+            
+            e_theta_deg = math.degrees(e_theta) 
+
+            if abs(e_theta) > self.theta_align: 
+                # CRITICAL CHANGE: v cannot be 0. We must move forward to keep our heading updated.
+                # It will make a tight U-Turn instead of spinning in place.
+                v = 0.20 
+                self.get_logger().info(f"ALIGNING: Angle Error {e_theta_deg:.1f}°. Making tight turn...", throttle_duration_sec=1.0)
+            else:
+                # Normal forward drive, ensuring it never goes below 0.2 m/s while tracking
+                v = clip(self.k_d * dist_to_goal, 0.20, self.v_max)
+                self.get_logger().info(f"ALIGNED: Angle Error {e_theta_deg:.1f}°. Driving forward.", throttle_duration_sec=1.0)
+
+        cmd = Twist()
+        cmd.linear.x = float(v)
+        cmd.angular.z = float(omega)
+        self.cmd_pub.publish(cmd)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = GoToBeaconOdom()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()
