@@ -1,11 +1,10 @@
-#!/usr/bin/env python3
 import math
 import rclpy
 import time
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Float32
-from geometry_msgs.msg import Pose, Twist, Point
+from std_msgs.msg import Float64
+from geometry_msgs.msg import Pose, Twist, Point, Vector3
 
 def yaw_from_quaternion(x, y, z, w):
     siny_cosp = 2.0 * (w * z + x * y)
@@ -38,11 +37,11 @@ class GoToBeaconOdom(Node):
         self.goal_received = False
 
         # -------- Parameters --------
-        self.declare_parameter("control_rate_hz", 10.0)
-        self.declare_parameter("k_theta", 1.8) # Angular Gain, how aggresively we turn. Oscillations when too high.
+        self.declare_parameter("control_rate_hz", 1.0)
+        self.declare_parameter("k_theta", 3) # Angular Gain, how aggresively we turn. Oscillations when too high.
         self.declare_parameter("k_d", 0.8) # Linear Gain. Scales speed based on distance. How much it slows down as it approaches the goal. Too high can cause overshoot, too low can be too slow.
         self.declare_parameter("v_max", 0.6)
-        self.declare_parameter("omega_max", 1.5)
+        self.declare_parameter("omega_max", 5)
         self.declare_parameter("goal_tolerance", 0.25)
         self.declare_parameter("theta_align_deg", 20.0) # if angle error larger then this, we just rotate in place.
 
@@ -55,10 +54,10 @@ class GoToBeaconOdom(Node):
         self.theta_align = math.radians(self.get_parameter("theta_align_deg").value) # Convert to radians
 
         # -------- I/O --------
-        self.cmd_pub = self.create_publisher(Twist, "/velocity_CRJG", 10)
+        self.cmd_pub = self.create_publisher(Twist, "/cmdV_CRJG", 10)
         
-        self.create_subscription(Odometry, "/position_CRJG", self.on_position, 10)
-        self.create_subscription(Float32, "/distance_CRJG", self.on_distance, 10)
+        self.create_subscription(Vector3, "/location_CRJG", self.on_position, 10)
+        self.create_subscription(Float64, "/distance_CRJG", self.on_distance, 10)
         # New: Subscriber for manual goal input from terminal
         self.create_subscription(Point, "/goal_point", self.on_goal, 10)
 
@@ -71,18 +70,19 @@ class GoToBeaconOdom(Node):
         self.get_logger().info("Navigation Node Initialized. Waiting for Goal on /goal_point...")
 
     def on_position(self, msg):
-        self.robot_x = msg.pose.pose.position.x
-        self.robot_y = msg.pose.pose.position.y
+        self.robot_x = msg.x
+        self.robot_y = msg.y
 
-        self.get_logger().info(f"Odom: x={self.robot_x:.2f}, y={self.robot_y:.2f}")
+        self.get_logger().info(f"Robot Position: x={self.robot_x:.2f}, y={self.robot_y:.2f}")
 
-        q = msg.pose.pose.orientation
-        self.robot_theta = yaw_from_quaternion(q.x, q.y, q.z, q.w)
+        q = 0
+        #self.robot_theta = yaw_from_quaternion(q.x, q.y, q.z, q.w)
+        self.robot_theta = 0
         self.odom_received = True
 
     def on_distance(self, msg):
         self.current_distance = msg.data
-        self.get_logger().info(f"Distance: {self.current_distance:.1f}")
+        self.get_logger().info(f"UltraSound: {self.current_distance:.1f}")
 
     def on_goal(self, msg):
         self.target_x = msg.x
@@ -92,11 +92,11 @@ class GoToBeaconOdom(Node):
 
     def control_step(self):
         # Wait until we have both a goal and our own position
-        if not self.goal_received or not self.odom_received:
-            return
+        # if not self.goal_received or not self.odom_received:
+        #     return
 
         # 1. Check Ultrasound
-        if self.current_distance < self.distance_threshold:
+        if self.current_distance < self.distance_threshold and self.current_distance > 0:
             self.state = "AVOID_OBSTACLE"
             self.is_clearing = False
 
@@ -106,7 +106,7 @@ class GoToBeaconOdom(Node):
         # 2. State Machine
         if self.state == "AVOID_OBSTACLE":
             v = 0.0 
-            omega = 0.5 
+            omega = 0 
             self.get_logger().warn("Obstacle Detected! Turning...", throttle_duration_sec=1)
             
             # Transition if LineOfSight is clear
@@ -122,7 +122,7 @@ class GoToBeaconOdom(Node):
             self.get_logger().info("Clearance: Driving Forward...", throttle_duration_sec=1)
 
             # Transition: Check if time is up
-            if (time.time() - self.clearance_start_time) > self.clearance_duration:
+            if (time.time() - self.clearance_start_time) > 2:
                 self.state = "GO_TO_GOAL"
                 self.is_clearing = False
             
@@ -130,8 +130,10 @@ class GoToBeaconOdom(Node):
             ex = self.target_x - self.robot_x
             ey = self.target_y - self.robot_y
             dist_to_goal = math.sqrt(ex**2 + ey**2)
+            self.get_logger().info(f"Distance to Goal: {dist_to_goal:.1f}")
 
-            if dist_to_goal < self.goal_tolerance: # Goal Reached
+
+            if abs(dist_to_goal) < self.goal_tolerance: # Goal Reached
                 self.cmd_pub.publish(Twist()) # Stop the robot
                 self.get_logger().info("Goal Reached!")
                 self.goal_received = False # Reset until next goal
@@ -146,10 +148,10 @@ class GoToBeaconOdom(Node):
 
             if abs(e_theta) > self.theta_align: # If error too big, we set velocity to zero and just rotate in place
                 v = 0.0
-                self.get_logger().info(f"ALIGNING: Error is {e_theta_deg:.1f}°. Spinning...", throttle_duration_sec=1.0)
+                self.get_logger().info(f"ALIGNING: Angle Error is {e_theta_deg:.1f}°. Spinning...", throttle_duration_sec=1.0)
             else:
                 v = clip(self.k_d * dist_to_goal, 0.0, self.v_max)
-                self.get_logger().info(f"ALIGNED: Error {e_theta_deg:.1f}°. Driving forward.", throttle_duration_sec=1.0)
+                self.get_logger().info(f"ALIGNED: Angle Error {e_theta_deg:.1f}°. Driving forward.", throttle_duration_sec=1.0)
 
             # FOR LATER OPTIMIZATION:
             # # Smooth slowing down around the goal
@@ -157,6 +159,7 @@ class GoToBeaconOdom(Node):
             # if dist_to_goal < slow_radius:
             #     v *= dist_to_goal / slow_radius
 
+        self.get_logger().info("Publishing to velocity!")
         cmd = Twist()
         cmd.linear.x = float(v)
         cmd.angular.z = float(omega)
