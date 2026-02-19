@@ -4,7 +4,7 @@ ROS2 (Janusz): https://github.com/JanuszJakubiak/bip2026_ws
 
 source /opt/ros/jazzy/setup.bash
 
-Test Commands:
+# Test Commands:
 ### Goal coordinate
 ros2 topic pub -1 /goal_point geometry_msgs/msg/Point "{x: 2.0, y: 2.0, z: 0.0}"
 ### Robot position
